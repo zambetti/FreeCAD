@@ -290,6 +290,34 @@ def wait_for_views(views, timeout=20):
     raise TimeoutError(f"Views did not settle: {[(v.Name, v.State) for v in views]}; {previous}")
 
 
+def wait_for_export_cleanup(views, timeout=20):
+    """Drain PDF redraw work without recomputing intentionally touched style properties."""
+    from PySide6 import QtCore
+
+    deadline = time.monotonic() + timeout
+    previous = None
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        pump_events()
+        signature = tuple(
+            tuple((round(edge.Length, 7),
+                   *(round(getattr(edge.BoundBox, axis), 7)
+                     for axis in ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax")))
+                  for edge in view.getVisibleEdges())
+            for view in views
+        )
+        # Style-only edits legitimately leave State == ['Touched']. Lengths alone
+        # cannot detect the moving-hole fixture, so also compare edge bounds.
+        ready = all(signature) and QtCore.QThreadPool.globalInstance().activeThreadCount() == 0
+        if not ready or signature != previous:
+            stable_since = time.monotonic()
+        elif time.monotonic() - stable_since >= 0.5:
+            return
+        previous = signature
+    raise TimeoutError(f"Export cleanup did not settle: {[(v.Name, v.State) for v in views]}; "
+                       f"{previous}")
+
+
 def make_fixture(output):
     import FreeCAD as App
     import FreeCADGui as Gui
@@ -540,6 +568,8 @@ def run_baseline(fixture, output, pdftoppm, log):
             log.write(f"{mode:8} {suffix}: section red={exports[suffix]['section']['red_pixels']}, "
                       f"detail red={exports[suffix]['detail']['red_pixels']}\n")
             log.flush()
+        # PDF cleanup starts an asynchronous page rebuild after rendering.
+        wait_for_export_cleanup([doc.Base, section, detail])
         observations[mode] = exports
         write_json(output / "observations.json", observations)
         if mode == "PatHatch":

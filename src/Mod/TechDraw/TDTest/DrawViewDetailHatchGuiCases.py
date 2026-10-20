@@ -40,7 +40,10 @@ rotation/offset defect; style-svg deliberately keeps that defect failing.
 Scope limits: one flat section, one explicit face (TechDraw's zero-based Face0),
 one through ellipse, and one moving round hole. Deferred updates cover geometry;
 style deferral, nested details, perspective and cross-version image tolerances
-are not established here.
+are not established here. Deferred image equality uses physical line widths
+(ScreenMode=False), not zoom-dependent screen strokes. Export snapshots drain
+PDF cleanup's asynchronous rebuild before a subsequent edit or teardown, without
+requiring style-only properties to become recomputed/Up-to-date.
 """
 
 import hashlib
@@ -235,6 +238,10 @@ class ScenarioContext:
                 path = self.output / f"{name}.{fmt}"
                 exporter(self.page, str(path))
                 images[fmt] = self.common["render_export"](path, self.pdftoppm)
+            # PDF postRenderCleanUp calls DrawPage::redrawCommand, starting fresh
+            # asynchronous geometry work. Drain it before the next edit/teardown;
+            # this does not recompute, requestPaint, or change the captured pixels.
+            self.common["wait_for_export_cleanup"]([self.doc.Base, self.section, self.detail])
         self.images[name] = images
         self.observations[name] = {
             "geometry": self.geometry(), "samples": {},
@@ -247,6 +254,9 @@ class ScenarioContext:
                 "detail_anchor": list(self.detail.AnchorPoint),
                 "detail_radius": self.detail.Radius,
                 "ShowMatting": self.detail.ShowMatting,
+                "ScreenMode": App.ParamGet(
+                    "User parameter:BaseApp/Preferences/Mod/TechDraw/View"
+                ).GetBool("ScreenMode", True),
                 "MattingStyle": App.ParamGet(
                     "User parameter:BaseApp/Preferences/Mod/TechDraw/Decorations"
                 ).GetInt("MattingStyle", 0),
@@ -695,7 +705,13 @@ class TransformTests(ScenarioTest):
 
 class DeferredUpdateTests(ScenarioTest):
     def test_keep_updated_defers_geometry_until_resumed(self):
+        import FreeCAD as App
+
         c = self.context
+        # QGIEdge screen strokes depend on viewport zoom/redraw scaling. Use
+        # physical widths so exact ink equality isolates geometry/fill freezing.
+        App.ParamGet("User parameter:BaseApp/Preferences/Mod/TechDraw/View").SetBool(
+            "ScreenMode", False)
         c.section.CutSurfaceDisplay = "Color"
         c.section.ViewObject.CutSurfaceColor = RED
         c.set_shape(stock_with_round_hole(-4))

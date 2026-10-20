@@ -313,30 +313,38 @@ void DrawViewSection::onChanged(const App::Property* prop)
         return;
     }
 
+    // These style handlers return before the normal property notification reaches
+    // the view provider, so notify dependent details here as well as this section.
+    const auto repaintCutSurfaces = [this] {
+        requestPaint();
+        for (auto* detail : getDetailRefs()) {
+            detail->requestPaint();
+        }
+    };
     if (prop == &CutSurfaceDisplay) {
         if (CutSurfaceDisplay.isValue("PatHatch")) {
             makeLineSets();
         }
-        requestPaint();
+        repaintCutSurfaces();
         return;
     }
 
     if (prop == &FileHatchPattern) {
         replaceSvgIncluded(FileHatchPattern.getValue());
-        requestPaint();
+        repaintCutSurfaces();
         return;
     }
 
     if (prop == &FileGeomPattern) {
         replacePatIncluded(FileGeomPattern.getValue());
         makeLineSets();
-        requestPaint();
+        repaintCutSurfaces();
         return;
     }
 
     if (prop == &NameGeomPattern) {
         makeLineSets();
-        requestPaint();
+        repaintCutSurfaces();
         return;
     }
 
@@ -645,6 +653,10 @@ void DrawViewSection::onSectionCutFinished()
         m_preparedShape.Nullify();
         m_sectionTopoDSFaces.Nullify();
         m_tdSectionFaces.clear();
+        geometryObject = std::make_shared<GeometryObject>(getNameInDocument(), this);
+        m_tempGeometryObject.reset();
+        bbox = Base::BoundBox3d();
+        m_faceExtractionSucceeded = false;
         overrideKeepUpdated(false);
         sectionFacesFinished();
         requestPaint();

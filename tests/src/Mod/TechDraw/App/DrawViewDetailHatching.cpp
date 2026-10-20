@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <iostream>
 #include <memory>
 #include <numbers>
 #include <optional>
@@ -195,6 +197,14 @@ public:
     void completeFaces()
     {
         sectionFacesFinished();
+    }
+
+    void seedEmptyCut()
+    {
+        // Preserve the previous projection until the real completion callback runs.
+        m_cutPieces = compound({});
+        m_sectionFacesReady = false;
+        waitingForCut(true);
     }
 
     void seedPattern(std::string spec = "0,0,0,0,1")
@@ -420,6 +430,69 @@ TEST_F(DrawViewDetailHatchingTest, styleChangesAndRepaintReuseOccCacheWithoutCha
         expectSameFaces(inherited, detail->getInheritedSectionFaces());
         EXPECT_EQ(detail->getFaceGeometry(), selectionFaces);
     }
+}
+
+TEST_F(DrawViewDetailHatchingTest, hundredSectionAndCoverageFacesReuseCacheAcrossStyleChanges)
+{
+    constexpr int side = 10;
+    constexpr int faceCount = side * side;
+    constexpr int cachedCalls = 100;
+    constexpr double expectedArea = faceCount * 4.0;
+    std::vector<TopoDS_Face> sectionFaces;
+    std::vector<TechDraw::FacePtr> coverage;
+    sectionFaces.reserve(faceCount);
+    coverage.reserve(faceCount);
+    for (int row = 0; row < side; ++row) {
+        for (int column = 0; column < side; ++column) {
+            const double x = 3.0 * column - 14.5;
+            const double y = 3.0 * row - 14.5;
+            sectionFaces.push_back(rectangle(x, y, x + 2.0, y + 2.0));
+            // Adjacent masks overlap inside the next section rectangle; the
+            // inherited union must fill each 2 x 2 section exactly once.
+            coverage.push_back(std::make_shared<TechDraw::Face>(
+                rectangle(x - 1.0, y, x + 3.5, y + 2.0)));
+        }
+    }
+    section->seedFaces(sectionFaces);
+    section->HatchScale.setValue(1.0);
+    detail->replaceCoverage(coverage);
+    detail->seedAcceptedFrame(section->getSectionFaces(), 50.0);
+    ASSERT_EQ(sectionFaces.size(), faceCount);
+    ASSERT_EQ(detail->getFaceGeometry().size(), faceCount);
+    ASSERT_TRUE(detail->faceExtractionSucceeded());
+    ASSERT_TRUE(detail->facesReady());
+    ASSERT_FALSE(detail->cacheValid());
+    const int executions = detail->executeCalls;
+
+    using Clock = std::chrono::steady_clock;
+    const auto firstStart = Clock::now();
+    const auto inherited = detail->getInheritedSectionFaces();
+    const auto firstElapsed = Clock::now() - firstStart;
+    ASSERT_TRUE(detail->cacheValid());
+    ASSERT_FALSE(inherited.empty());
+    // OCC may retain partitions at mask overlaps; summed area must not duplicate fill.
+    expectArea(inherited, expectedArea);
+
+    // Measure only getters, excluding style changes and topology/area assertions.
+    Clock::duration cachedElapsed = Clock::duration::zero();
+    for (int iteration = 0; iteration < cachedCalls; ++iteration) {
+        SCOPED_TRACE(iteration);
+        if (iteration % 10 == 0) {
+            section->HatchScale.setValue(2.0 + iteration / 10);
+        }
+        const auto cachedStart = Clock::now();
+        const auto cached = detail->getInheritedSectionFaces();
+        cachedElapsed += Clock::now() - cachedStart;
+        EXPECT_TRUE(detail->cacheValid());
+        expectSameFaces(inherited, cached);
+    }
+    EXPECT_EQ(detail->getFaceGeometry(), coverage);
+    EXPECT_EQ(detail->executeCalls, executions);
+    std::cout << "[ detail hatch 100x100 ] first getter: "
+              << std::chrono::duration<double, std::milli>(firstElapsed).count()
+              << " ms; " << cachedCalls << " cached getters total: "
+              << std::chrono::duration<double, std::milli>(cachedElapsed).count()
+              << " ms\n";
 }
 
 TEST_F(DrawViewDetailHatchingTest, normalizedExclusionsReuseCacheAndChangedExclusionsRestoreCoverage)
@@ -772,6 +845,55 @@ TEST_F(DrawViewDetailHatchingTest, headlessDocumentPipelinePublishesCompletedInh
         EXPECT_NE(face->getRepresentation(), TechDraw::FaceRepresentation::Hollow);
     }
     EXPECT_EQ(detail->getFaceGeometry(), selectable);
+}
+
+TEST_F(DrawViewDetailHatchingTest, emptySectionCutClearsOrdinaryProjectionAndCancelsPendingDetail)
+{
+    ASSERT_NO_FATAL_FAILURE(buildBoxPipeline());
+    ASSERT_FALSE(section->getEdgeGeometry().empty());
+    ASSERT_FALSE(section->getFaceGeometry().empty());
+    ASSERT_TRUE(section->getBoundingBox().IsValid());
+    ASSERT_FALSE(detail->getInheritedSectionFaces().empty());
+    ASSERT_TRUE(detail->cacheValid());
+
+    section->seedEmptyCut();
+    section->overrideKeepUpdated(true);
+    ASSERT_TRUE(section->waitingForCut());
+    ASSERT_FALSE(section->hasCompletedSectionFaces());
+    page->forceRedraw(true);
+    ASSERT_TRUE(detail->recomputeFeature());
+    page->forceRedraw(false);
+    ASSERT_FALSE(page->KeepUpdated.getValue());
+    ASSERT_TRUE(detail->pending());
+    ASSERT_TRUE(detail->waitingForResult());
+    ASSERT_TRUE(detail->overrideKeepUpdated());
+    const int deferredExecutions = detail->executeCalls;
+
+    // Exercise the void-cut branch and its dependent notification, not a manual cleanup.
+    ASSERT_NO_THROW(section->onSectionCutFinished());
+    EXPECT_FALSE(section->waitingForCut());
+    EXPECT_FALSE(section->waitingForHlr());
+    EXPECT_FALSE(section->waitingForFaces());
+    EXPECT_FALSE(section->waitingForResult());
+    EXPECT_FALSE(section->overrideKeepUpdated());
+    EXPECT_TRUE(section->hasCompletedSectionFaces());
+    EXPECT_TRUE(section->getShapeForDetail().IsNull());
+    EXPECT_TRUE(section->getSectionFaces().IsNull());
+    EXPECT_TRUE(section->getTDFaceGeometry().empty());
+    EXPECT_TRUE(section->getEdgeGeometry().empty());
+    EXPECT_TRUE(section->getFaceGeometry().empty());
+    EXPECT_FALSE(section->getBoundingBox().IsValid());
+
+    // Only inherited state is in scope for the detail, not its historical display retention.
+    EXPECT_GT(detail->executeCalls, deferredExecutions);
+    EXPECT_FALSE(detail->pending());
+    EXPECT_FALSE(detail->updateActive());
+    EXPECT_FALSE(detail->waitingForResult());
+    EXPECT_FALSE(detail->overrideKeepUpdated());
+    EXPECT_FALSE(detail->facesReady());
+    EXPECT_TRUE(detail->capturedSection().IsNull());
+    EXPECT_TRUE(detail->getInheritedSectionFaces().empty());
+    EXPECT_FALSE(detail->cacheValid());
 }
 
 TEST_F(DrawViewDetailHatchingTest, detailRedrawUsesFrozenSectionFaceScaleAndRotationSnapshots)

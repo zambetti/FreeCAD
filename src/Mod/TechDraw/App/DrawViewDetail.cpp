@@ -26,7 +26,9 @@
 #include <Mod/Part/App/FCBRepAlgoAPI_Common.h>
 #include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_Copy.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepProj_Projection.hxx>
@@ -43,9 +45,11 @@
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
 #include <gp_Ax2.hxx>
+#include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <algorithm>
 #include <sstream>
 
 
@@ -53,14 +57,17 @@
 #include <App/Document.h>
 #include <Base/Console.h>
 #include <Base/Parameter.h>
+#include <Base/Tools.h>
 #include <Base/UnitsApi.h>
 
+#include "DetailHatchGeometry.h"
 #include "DrawComplexSection.h"
 #include "DrawPage.h"
 #include "DrawUtil.h"
 #include <App/FeaturePythonPyImp.h>
 #include "DrawViewDetail.h"
 #include "DrawViewPartPy.h"
+#include "DrawViewDimension.h"
 #include "DrawViewSection.h"
 #include "GeometryObject.h"
 #include "Preferences.h"
@@ -133,6 +140,14 @@ void DrawViewDetail::onChanged(const App::Property* prop)
         return;
     }
 
+    if (prop == &BaseView) {
+        m_inheritedFacesReady = false;
+        m_hatchCacheValid = false;
+        if (!dynamic_cast<DrawViewPart*>(BaseView.getValue())) {
+            cancelInheritedUpdate();
+        }
+    }
+
     if (prop == &Reference) {
         std::string captionText = makeCaption();
         Caption.setValue(captionText);
@@ -184,25 +199,33 @@ App::DocumentObjectExecReturn* DrawViewDetail::execute()
     }
 
     App::DocumentObject* baseObj = BaseView.getValue();
-    if (!baseObj) {
-        return DrawView::execute();
-    }
-
-    if (!baseObj->isDerivedFrom<TechDraw::DrawViewPart>()) {
-        //this can only happen via scripting?
+    if (!baseObj || !baseObj->isDerivedFrom<TechDraw::DrawViewPart>()) {
+        cancelInheritedUpdate();
         return DrawView::execute();
     }
 
     DrawViewPart* dvp = static_cast<DrawViewPart*>(baseObj);
-    TopoDS_Shape shape3d = dvp->getShapeForDetail();
     DrawViewSection* dvs = nullptr;
     if (dvp->isDerivedFrom<TechDraw::DrawViewSection>()) {
         dvs = static_cast<TechDraw::DrawViewSection*>(dvp);
     }
 
+    if (waitingForDetail() || waitingForHlr() || waitingForFaces()
+        || (dvs && (!dvs->hasCompletedSectionFaces() || dvs->waitingForResult()))) {
+        // A redraw accepted while the page is frozen must remain authorized
+        // across the parent's asynchronous cut/HLR/face-finding stages.
+        m_pendingRecompute = true;
+        overrideKeepUpdated(true);
+        return App::DocumentObject::StdReturn;
+    }
+
+    TopoDS_Shape shape3d = dvp->getShapeForDetail();
     if (shape3d.IsNull()) {
+        cancelInheritedUpdate();
         return DrawView::execute();
     }
+
+    m_pendingRecompute = false;
 
     bool haveX = checkXDirection();
     if (!haveX) {
@@ -227,10 +250,46 @@ void DrawViewDetail::detailExec(TopoDS_Shape& shape, DrawViewPart* dvp, DrawView
         return;
     }
 
+    // Use one accepted input snapshot for both the worker and the hatch frame.
+    // This also covers a second pass after automatic scaling.
+    m_detailParameters = {dvp->Direction.getValue(), AnchorPoint.getValue(), dvp->getProjectionCS(),
+                          Radius.getValue(), getScale(), Rotation.getValue(),
+                          static_cast<bool>(Preferences::mattingStyle())};
+    m_detailUpdateActive = true;
+    m_inheritedFacesReady = false;
+    m_hatchCacheValid = false;
+    m_detailShapeReady = false;
+    m_scaledShape.Nullify();
+    m_hatchSource = dvs;
+    m_hatchSectionFaces = dvs ? dvs->getSectionFaces() : TopoDS_Shape();
+    m_hatchRadius = m_detailParameters.radius * m_detailParameters.scale;
+    if (dvs) {
+        const auto* complex = dynamic_cast<DrawComplexSection*>(dvs);
+        const bool preparedSource = complex && complex->ProjectionStrategy.getValue() != 0;
+        gp_Trsf scale;
+        scale.SetScale(gp_Pnt(), m_detailParameters.scale /
+                       (preparedSource ? 1.0 : dvs->getSectionFaceScale()));
+        // Ordinary sections return an unscaled cut with the current rotation;
+        // aligned complex sections return their already-prepared (scaled) shape.
+        gp_Trsf parentRotation;
+        parentRotation.SetRotation(gp_Ax1(gp_Pnt(), gp_Dir(0, 0, 1)),
+            preparedSource ? 0.0 : -Base::toRadians(dvs->Rotation.getValue() -
+                                                   dvs->getSectionFaceRotation()));
+        const auto anchor = m_detailParameters.anchor;
+        gp_Trsf translate;
+        translate.SetTranslation(gp_Vec(-anchor.x * m_detailParameters.scale,
+                                        anchor.y * m_detailParameters.scale, 0));
+        gp_Trsf rotate;
+        rotate.SetRotation(gp_Ax1(gp_Pnt(), gp_Dir(0, 0, 1)),
+                           -Base::toRadians(m_detailParameters.rotation));
+        m_hatchTransform = rotate * translate * parentRotation * scale;
+    }
+
     if (!DU::isGuiUp()) {
         makeDetailShape(shape, dvp, dvs);
         onMakeDetailFinished();
         waitingForDetail(false);
+        return;
     }
 
     //note that &m_detailWatcher in the third parameter is not strictly required, but using the
@@ -257,8 +316,8 @@ void DrawViewDetail::makeDetailShape(const TopoDS_Shape& shape3d, DrawViewPart* 
 {
     showProgressMessage(getNameInDocument(), "is making detail shape");
 
-    Base::Vector3d dirDetail = dvp->Direction.getValue();
-    double radius = getFudgeRadius();
+    Base::Vector3d dirDetail = m_detailParameters.direction;
+    double radius = m_detailParameters.radius * m_fudge;
 
     //make a copy of the input shape so we don't inadvertently change it
     BRepBuilderAPI_Copy BuilderCopy(shape3d);
@@ -280,8 +339,8 @@ void DrawViewDetail::makeDetailShape(const TopoDS_Shape& shape3d, DrawViewPart* 
     shapeCenter = Base::Vector3d(0.0, 0.0, 0.0);
 
 
-    m_viewAxis = dvp->getProjectionCS(shapeCenter);//save the CS for later
-    Base::Vector3d anchor = AnchorPoint.getValue();//this is a 2D point in base view local coords
+    m_viewAxis = m_detailParameters.viewAxis;
+    Base::Vector3d anchor = m_detailParameters.anchor;//2D point in base view local coords
 
     anchor = DrawUtil::toR3(m_viewAxis, anchor);//actual anchor coords in R3
 
@@ -301,7 +360,7 @@ void DrawViewDetail::makeDetailShape(const TopoDS_Shape& shape3d, DrawViewPart* 
 
     gp_Vec extrudeDir(extrudeVec.x, extrudeVec.y, extrudeVec.z);
     TopoDS_Shape tool;
-    if (Preferences::mattingStyle()) {
+    if (m_detailParameters.square) {
         //square mat
         gp_Pln gpln(gpnt, gdir);
         BRepBuilderAPI_MakeFace mkFace(gpln, -radius, radius, -radius, radius);
@@ -341,7 +400,7 @@ void DrawViewDetail::makeDetailShape(const TopoDS_Shape& shape3d, DrawViewPart* 
         const TopoDS_Solid& s = TopoDS::Solid(expl1.Current());
         FCBRepAlgoAPI_Common mkCommon(s, tool);
         if (!mkCommon.IsDone()) {
-            continue;
+            return; // Do not publish a partial crop as completed inherited coverage.
         }
         if (mkCommon.Shape().IsNull()) {
             continue;
@@ -360,7 +419,7 @@ void DrawViewDetail::makeDetailShape(const TopoDS_Shape& shape3d, DrawViewPart* 
         const TopoDS_Shell& s = TopoDS::Shell(expl2.Current());
         FCBRepAlgoAPI_Common mkCommon(s, tool);
         if (!mkCommon.IsDone()) {
-            continue;
+            return;
         }
         if (mkCommon.Shape().IsNull()) {
             continue;
@@ -380,7 +439,7 @@ void DrawViewDetail::makeDetailShape(const TopoDS_Shape& shape3d, DrawViewPart* 
         const TopoDS_Edge& e = TopoDS::Edge(expl3.Current());
         FCBRepAlgoAPI_Common mkCommon(e, tool);
         if (!mkCommon.IsDone()) {
-            continue;
+            return;
         }
         if (mkCommon.Shape().IsNull()) {
             continue;
@@ -403,23 +462,27 @@ void DrawViewDetail::makeDetailShape(const TopoDS_Shape& shape3d, DrawViewPart* 
         BRepTools::Write(m_detailShape, "DVDCommon.brep"); //debug
     }
 
+    Bnd_Box cropBounds;
+    BRepBndLib::AddOptimal(m_detailShape, cropBounds);
+    if (cropBounds.IsVoid()) {
+        return;
+    }
     gp_Pnt inputCenter = ShapeUtils::findCentroid(m_detailShape, dirDetail);
     Base::Vector3d centroid(inputCenter.X(), inputCenter.Y(), inputCenter.Z());
     m_saveCentroid += centroid;//center of massaged shape
     //align shape with detail anchor
     TopoDS_Shape centeredShape = ShapeUtils::moveShape(m_detailShape, anchor * -1.0);
-    m_scaledShape = ShapeUtils::scaleShape(centeredShape, getScale());
+    m_scaledShape = ShapeUtils::scaleShape(centeredShape, m_detailParameters.scale);
 
     if (debugDetail()) {
         BRepTools::Write(m_scaledShape, "DVDScaled.brep");//debug
     }
 
-    Base::Vector3d stdOrg(0.0, 0.0, 0.0);
-    m_viewAxis = dvp->getProjectionCS(stdOrg);
-
-    if (!DrawUtil::fpCompare(Rotation.getValue(), 0.0)) {
-        m_scaledShape = ShapeUtils::rotateShape(m_scaledShape, m_viewAxis, Rotation.getValue());
+    if (!DrawUtil::fpCompare(m_detailParameters.rotation, 0.0)) {
+        m_scaledShape = ShapeUtils::rotateShape(m_scaledShape, m_viewAxis,
+                                                m_detailParameters.rotation);
     }
+    m_detailShapeReady = !m_scaledShape.IsNull();
 
     showProgressMessage(getNameInDocument(), "has finished making detail shape");
 }
@@ -428,24 +491,154 @@ void DrawViewDetail::postHlrTasks(void)
 {
     DrawViewPart::postHlrTasks();
 
-    geometryObject->pruneVertexGeom(Base::Vector3d(0.0, 0.0, 0.0),
-                                    Radius.getValue()
-                                        * getScale());//remove vertices beyond clipradius
-
-    //second pass if required
-    if (ScaleType.isValue("Automatic") && !checkFit()) {
-        double newScale = autoScale();
-        Scale.setValue(newScale);
-        detailExec(m_saveShape, m_saveDvp, m_saveDvs);
-    }
+    geometryObject->pruneVertexGeom(Base::Vector3d(0.0, 0.0, 0.0), m_hatchRadius);
 
     auto* baseView = freecad_cast<DrawViewPart*>(BaseView.getValue());
-    if (!baseView) {
-        throw Base::RuntimeError("Detail has no base view!");
+    if (baseView) {
+        baseView->requestPaint();   // repaint the highlight on the base view.
     }
-    baseView->requestPaint();   // repaint the highlight on the base view.
 
+    if (handleFaces() && !CoarseView.getValue()) {
+        overrideKeepUpdated(m_detailUpdateActive);
+    }
+    else {
+        finishDetailUpdate();
+    }
+}
+
+void DrawViewDetail::postFaceExtractionTasks()
+{
+    // Dimensions on a frozen page must finish the redraw that produced their
+    // reference geometry, even though DrawViewPart::postHlrTasks cleared its flag.
+    if (m_detailUpdateActive) {
+        for (auto* dimension : getDimensions()) {
+            dimension->overrideKeepUpdated(true);
+        }
+    }
+    m_inheritedFacesReady = faceExtractionSucceeded() && !getFaceGeometry().empty();
+    if (!m_inheritedFacesReady) {
+        m_hatchCacheValid = false;
+    }
+    DrawViewPart::postFaceExtractionTasks();
+    finishDetailUpdate();
+}
+
+void DrawViewDetail::cancelInheritedUpdate()
+{
+    m_pendingRecompute = false;
+    m_detailUpdateActive = false;
+    m_inheritedFacesReady = false;
+    m_hatchCacheValid = false;
+    m_hatchSource = nullptr;
+    m_hatchSectionFaces.Nullify();
     overrideKeepUpdated(false);
+}
+
+void DrawViewDetail::finishDetailUpdate()
+{
+    if (m_detailUpdateActive && ScaleType.isValue("Automatic") && !checkFit()) {
+        const double newScale = autoScale();
+        if (!DrawUtil::fpCompare(newScale, m_detailParameters.scale)) {
+            Scale.setValue(newScale);
+            m_pendingRecompute = true;
+        }
+    }
+    m_detailUpdateActive = false;
+    overrideKeepUpdated(m_pendingRecompute);
+    onBaseSectionReady();
+}
+
+void DrawViewDetail::onBaseSectionReady()
+{
+    auto* section = dynamic_cast<DrawViewSection*>(BaseView.getValue());
+    if (m_pendingRecompute && !waitingForDetail() && !waitingForHlr() && !waitingForFaces()
+        && (!section || (section->hasCompletedSectionFaces() && !section->waitingForResult()))) {
+        m_pendingRecompute = false;
+        recomputeFeature();
+    }
+    requestPaint();
+}
+
+std::vector<TopoDS_Face> DrawViewDetail::getInheritedSectionFaces(
+    const std::vector<int>& excludedDetailFaceIndices) const
+{
+    if (!m_inheritedFacesReady || waitingForResult() || m_hatchSectionFaces.IsNull()) {
+        return {};
+    }
+    auto* section = dynamic_cast<DrawViewSection*>(BaseView.getValue());
+    if (!section || section != m_hatchSource || section->waitingForResult()
+        || !section->hasCompletedSectionFaces()) {
+        return {};
+    }
+
+    const auto faces = getFaceGeometry();
+    std::vector<bool> hollow;
+    hollow.reserve(faces.size());
+    for (const auto& face : faces) {
+        hollow.push_back(face->getRepresentation() == FaceRepresentation::Hollow);
+    }
+    auto exclusions = excludedDetailFaceIndices;
+    std::sort(exclusions.begin(), exclusions.end());
+    exclusions.erase(std::unique(exclusions.begin(), exclusions.end()), exclusions.end());
+    const bool matting = ShowMatting.getValue();
+    const bool square = Preferences::mattingStyle();
+    if (m_hatchCacheValid && faces == m_cachedDetailFaces && hollow == m_cachedHollowFaces
+        && exclusions == m_cachedExcludedFaces && matting == m_cachedMatting
+        && square == m_cachedSquareClip) {
+        return m_cachedInheritedFaces;
+    }
+
+    m_hatchCacheValid = false;
+    try {
+        std::vector<TopoDS_Face> coverage;
+        coverage.reserve(faces.size());
+        for (const auto& face : faces) {
+            // These are coverage masks only. The authoritative cut faces above
+            // never pass through TechDraw display geometry, including for PAT.
+            if (face->getRepresentation() == FaceRepresentation::Hollow) {
+                coverage.emplace_back();
+                continue;
+            }
+            auto mask = face->toOccFace();
+            if (mask.IsNull()) {
+                return {}; // Failed conversion is not the same as an intentionally absent mask.
+            }
+            coverage.push_back(mask);
+        }
+        const double radius = m_hatchRadius * (matting ? 1.0 : m_fudge);
+        if (radius <= Precision::Confusion()) {
+            return {};
+        }
+        TopoDS_Face clip;
+        if (square) {
+            clip = BRepBuilderAPI_MakeFace(gp_Pln(), -radius, radius, -radius, radius).Face();
+        }
+        else {
+            const gp_Circ circle(gp_Ax2(gp_Pnt(), gp_Dir(0, 0, 1)), radius);
+            clip = BRepBuilderAPI_MakeFace(
+                BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circle).Edge()).Wire()).Face();
+        }
+        if (!matting && square) {
+            // Without the mat, the visible square crop rotates with the detail.
+            clip = TopoDS::Face(ShapeUtils::rotateShape(clip, gp_Ax2(),
+                                                       -m_detailParameters.rotation));
+        }
+        auto result = DetailHatchGeometry::intersect(m_hatchSectionFaces, m_hatchTransform,
+                                                    coverage, clip, exclusions);
+        m_cachedInheritedFaces = std::move(result);
+        m_cachedDetailFaces = faces;
+        m_cachedHollowFaces = std::move(hollow);
+        m_cachedExcludedFaces = std::move(exclusions);
+        m_cachedMatting = matting;
+        m_cachedSquareClip = square;
+        m_hatchCacheValid = true;
+        return m_cachedInheritedFaces;
+    }
+    catch (const Standard_Failure& error) {
+        Base::Console().warning("Detail hatch mapping failed for {}: {}\n",
+                                getNameInDocument(), error.GetMessageString());
+    }
+    return {};
 }
 
 TopoDS_Shape DrawViewDetail::getShapeForGeometryBuild() const
@@ -458,6 +651,13 @@ void DrawViewDetail::onMakeDetailFinished(void)
 {
     waitingForDetail(false);
     QObject::disconnect(connectDetailWatcher);
+    if (!m_detailShapeReady) {
+        Base::Console().warning("Detail crop did not complete for {}; inherited hatching is unavailable\n",
+                                getNameInDocument());
+        cancelInheritedUpdate();
+        requestPaint();
+        return;
+    }
 
     m_tempGeometryObject = buildGeometryObject(getShapeForGeometryBuild(), m_viewAxis);
     if (!DU::isGuiUp()) {
@@ -467,7 +667,7 @@ void DrawViewDetail::onMakeDetailFinished(void)
 
 bool DrawViewDetail::waitingForResult() const
 {
-    if (DrawViewPart::waitingForResult() || waitingForDetail()) {
+    if (DrawViewPart::waitingForResult() || waitingForDetail() || m_pendingRecompute) {
         return true;
     }
     return false;

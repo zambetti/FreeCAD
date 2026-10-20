@@ -37,6 +37,7 @@
 #include <Mod/TechDraw/App/DrawComplexSection.h>
 #include <Mod/TechDraw/App/DrawGeomHatch.h>
 #include <Mod/TechDraw/App/DrawHatch.h>
+#include <Mod/TechDraw/App/DrawViewDetail.h>
 #include <Mod/TechDraw/App/Preferences.h>
 
 
@@ -97,11 +98,12 @@ ViewProviderViewSection::~ViewProviderViewSection()
 //for VP properties
 void ViewProviderViewSection::onChanged(const App::Property* prop)
 {
-    if (prop == &WeightPattern   ||
-        prop == &HatchColor      ||
-        prop == &GeomHatchColor      ||
-        prop == &CutSurfaceColor ||
-        prop == &CutSurfaceTransparency ||
+    const bool surfaceStyleChanged = prop == &WeightPattern ||
+                                     prop == &HatchColor ||
+                                     prop == &GeomHatchColor ||
+                                     prop == &CutSurfaceColor ||
+                                     prop == &CutSurfaceTransparency;
+    if (surfaceStyleChanged ||
         prop == &SectionLineFont ||
         prop == &SectionLineFontsize ||
         prop == &SectionLineArrowsize) {
@@ -109,17 +111,27 @@ void ViewProviderViewSection::onChanged(const App::Property* prop)
     }
 
     ViewProviderViewPart::onChanged(prop);
+
+    if (surfaceStyleChanged || prop == &LineWidth) {
+        repaintDependentDetails();
+    }
 }
 
 //for Feature properties
 void ViewProviderViewSection::updateData(const App::Property* prop)
 {
-    if (prop == &(getViewObject()->FileHatchPattern)   ||
-        prop == &(getViewObject()->CutSurfaceDisplay)    ||
-        prop == &(getViewObject()->NameGeomPattern)    ||
-        prop == &(getViewObject()->HatchScale)  ||
-        prop == &(getViewObject()->HatchRotation) ) {
+    auto* section = getViewObject();
+    if (section && (prop == &section->CutSurfaceDisplay ||
+                    prop == &section->FileHatchPattern ||
+                    prop == &section->SvgIncluded ||
+                    prop == &section->FileGeomPattern ||
+                    prop == &section->PatIncluded ||
+                    prop == &section->NameGeomPattern ||
+                    prop == &section->HatchScale ||
+                    prop == &section->HatchRotation ||
+                    prop == &section->HatchOffset)) {
         updateGraphic();
+        repaintDependentDetails();
     }
 
     ViewProviderViewPart::updateData(prop);
@@ -131,6 +143,20 @@ void ViewProviderViewSection::updateGraphic()
     QGIView* qgiv = getQView();
     if (qgiv) {
         qgiv->updateView(true);
+    }
+}
+
+void ViewProviderViewSection::repaintDependentDetails()
+{
+    auto* section = getViewObject();
+    if (!section || section->isRemoving() || section->isRestoring()) {
+        return;
+    }
+
+    for (auto* detail : section->getDetailRefs()) {
+        if (detail && !detail->isRemoving() && !detail->isRestoring()) {
+            detail->requestPaint();
+        }
     }
 }
 

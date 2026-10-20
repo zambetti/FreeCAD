@@ -128,6 +128,7 @@ public:
     void sectionExec(TopoDS_Shape& s);
     virtual void makeSectionCut(const TopoDS_Shape& baseShape);
     void postHlrTasks() override;
+    void postFaceExtractionTasks() override;
     virtual void postSectionCutTasks();
     void waitingForCut(bool s) { m_waitingForCut = s; }
     bool waitingForCut() const { return m_waitingForCut; }
@@ -152,6 +153,10 @@ public:
     //section face related methods
     std::vector<TechDraw::FacePtr> getTDFaceGeometry() { return m_tdSectionFaces; }
     TopoDS_Face getSectionTopoDSFace(int i);
+    TopoDS_Shape getSectionFaces() const { return m_sectionTopoDSFaces; }
+    bool hasCompletedSectionFaces() const { return m_sectionFacesReady; }
+    double getSectionFaceScale() const { return m_sectionFaceScale; }
+    double getSectionFaceRotation() const { return m_sectionFaceRotation; }
     virtual TopoDS_Compound alignSectionFaces(const TopoDS_Shape& faceIntersections);
     TopoDS_Compound mapToPage(const TopoDS_Shape& shapeToAlign);
     virtual std::vector<TechDraw::FacePtr> makeTDSectionFaces(const TopoDS_Compound& topoDSFaces);
@@ -159,6 +164,7 @@ public:
 
     void makeLineSets();
     std::vector<LineSet> getDrawableLines(int i = 0);
+    std::vector<LineSet> getDrawableLines(const TopoDS_Face& face);
     std::vector<PATLineSpec> getDecodedSpecsFromFile(std::string fileSpec, std::string myPattern);
 
     TopoDS_Shape getCutShape() const { return m_cutShape; }
@@ -217,6 +223,10 @@ protected:
     QFutureWatcher<void> m_cutWatcher;
     QFuture<void> m_cutFuture;
     bool m_waitingForCut;
+    bool m_sectionFacesReady = false;
+    double m_sectionFaceScale = 1.0;
+    double m_sectionFaceRotation = 0.0;
+    void sectionFacesFinished();
     TopoDS_Shape m_cuttingTool;
     double m_shapeSize;
 

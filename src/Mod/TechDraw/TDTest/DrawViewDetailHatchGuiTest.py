@@ -21,6 +21,8 @@ Exit codes: 0 = all assertions passed; 1 = regression assertion failure;
 2 = setup/export/render/process error; 124 = child process timeout. Missing hatch
 inheritance is intentionally a failure, not an expectedFailure or a skip.
 
+Each completed scenario writes result.json, methods.json and subtests.json with
+separate executed method/subtest counts; a failed subtest also fails its method.
 The default --case baseline retains the quick presence/absence reproducer.
 Use --list-cases for the additional scenarios in DrawViewDetailHatchGuiCases.py.
 Repeat --case to select scenarios, or use --case all. Each scenario gets its own
@@ -36,6 +38,20 @@ already-installed Poppler instead. Real GUI cases need a usable screen/WindowSer
 this macOS terminal sandbox required GUI access approval.
 New scenarios must be runtime-validated once the implementation build is ready;
 listing/counting cases is not evidence that their assertions have passed.
+
+--case transforms adds three bounded live/SVG/PDF snapshots: unrotated, parent
+90 degrees, and parent 90 + detail 45 degrees, with an off-center hole and an
+unmatted square crop. The default quick baseline is unchanged.
+
+Known shared exporter limitation: style-svg intentionally fails if exported
+rotation/offset is lost, even when the live scene is correct. A byte comparison
+against 33adf618dcebfb167795a219175e7dbb18f7a353 found AppTechDrawGuiPy.cpp,
+PagePrinter.cpp and QGSPage.cpp/.h entirely unchanged, as well as QGIFace's draw,
+exporting, loadSvgHatch, buildSvgHatch, buildPixHatch and setHatchColor functions.
+buildPixHatch's rotation/offset transform is commented out in both revisions.
+This is source-confirmed pre-existing, NOT historical runtime validation: the
+saved baseline exports only cover zero rotation/default offset. Keep the strict
+assertions, not skips/expectedFailure, until the shared exporter is fixed.
 """
 
 import argparse
@@ -212,7 +228,8 @@ def launch_scenario(binary, pdftoppm, output, timeout, case):
             print(result[key])
     print(f"SUMMARY: {result['status']}; GUI exit={process.returncode}; "
           f"tests={result.get('tests', 0)}, failures={result.get('failures', 0)}, "
-          f"errors={result.get('errors', 0)}")
+          f"errors={result.get('errors', 0)}, methods={result.get('methods', {})}, "
+          f"subtests={result.get('subtests', {})}")
     # FreeCAD's main() returns zero after the Qt event loop, even for exit(1).
     # The launcher propagates the assertions through result.json instead.
     if process.returncode != 0:
@@ -451,6 +468,55 @@ class DetailHatchExportTests(unittest.TestCase):
                     self.assertEqual(sample["red_pixels"], 0)
 
 
+class RecordingResult(unittest.TextTestResult):
+    """Count completed subtests separately from their owning test methods."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.method_outcomes = {}
+        self.subtest_outcomes = []
+
+    def startTest(self, test):
+        self.method_outcomes[test.id()] = "RUNNING"
+        super().startTest(test)
+
+    def addSuccess(self, test):
+        self.method_outcomes[test.id()] = "PASS"
+        super().addSuccess(test)
+
+    def addFailure(self, test, err):
+        self.method_outcomes[test.id()] = "FAIL"
+        super().addFailure(test, err)
+
+    def addError(self, test, err):
+        self.method_outcomes[test.id()] = "ERROR"
+        super().addError(test, err)
+
+    def addSkip(self, test, reason):
+        self.method_outcomes[test.id()] = "SKIP"
+        super().addSkip(test, reason)
+
+    def addSubTest(self, test, subtest, err):
+        outcome = "PASS" if err is None else (
+            "FAIL" if issubclass(err[0], test.failureException) else "ERROR")
+        self.subtest_outcomes.append({"id": subtest.id(), "outcome": outcome})
+        if outcome != "PASS" and self.method_outcomes[test.id()] != "ERROR":
+            self.method_outcomes[test.id()] = outcome
+        super().addSubTest(test, subtest, err)
+
+    def counts(self):
+        def tally(outcomes):
+            return {"total": len(outcomes),
+                    **{state.lower(): outcomes.count(state)
+                       for state in ("PASS", "FAIL", "ERROR", "SKIP", "RUNNING")}}
+        return {"methods": tally(list(self.method_outcomes.values())),
+                "subtests": tally([item["outcome"] for item in self.subtest_outcomes])}
+
+
+def run_suite(suite, log):
+    return unittest.TextTestRunner(stream=log, verbosity=2, resultclass=RecordingResult).run(suite)
+
+
 def run_baseline(fixture, output, pdftoppm, log):
     import FreeCADGui as Gui
     import TechDrawGui
@@ -480,13 +546,13 @@ def run_baseline(fixture, output, pdftoppm, log):
             doc.saveAs(str(output / "reproducer.FCStd"))
     DetailHatchExportTests.observations = observations
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(DetailHatchExportTests)
-    return unittest.TextTestRunner(stream=log, verbosity=2).run(suite)
+    return run_suite(suite, log)
 
 
 def run_gui_tests(output_dir, pdftoppm, case="baseline"):
     """Entry point called by the launcher's macro, after the GUI event loop starts."""
     import FreeCAD as App
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore
 
     output = Path(output_dir)
     doc = None
@@ -517,13 +583,16 @@ def run_gui_tests(output_dir, pdftoppm, case="baseline"):
             else:
                 _, extra = scenario_registry()
                 suite = extra["make_suite"](case, globals(), fixture, output, pdftoppm)
-                tests = unittest.TextTestRunner(stream=log, verbosity=2).run(suite)
+                tests = run_suite(suite, log)
         code = 2 if tests.errors else (0 if tests.wasSuccessful() else 1)
         result = {"status": "PASS" if code == 0 else "FAIL" if code == 1 else "ERROR",
                   "exit_code": code, "tests": tests.testsRun,
                   "failures": len(tests.failures), "errors": len(tests.errors),
                   "failed_checks": [test.id() for test, _ in tests.failures],
-                  "skipped": len(tests.skipped)}
+                  "errored_checks": [test.id() for test, _ in tests.errors],
+                  "skipped": len(tests.skipped), **tests.counts()}
+        write_json(output / "subtests.json", tests.subtest_outcomes)
+        write_json(output / "methods.json", tests.method_outcomes)
     except Exception:  # noqa: BLE001 - Publish any GUI callback failure before shutting down.
         result["exception"] = traceback.format_exc()
     finally:
@@ -535,7 +604,9 @@ def run_gui_tests(output_dir, pdftoppm, case="baseline"):
         result["case"] = case
         result["elapsed_seconds"] = time.monotonic() - started
         write_json(output / "result.json", result)
-        QtCore.QTimer.singleShot(0, QtWidgets.QApplication.instance().quit)
+        # Exit the isolated event loop directly; quit() can be vetoed by a window.
+        # The launcher reads the test outcome from result.json, not FreeCAD's exit code.
+        QtCore.QTimer.singleShot(0, lambda: QtCore.QCoreApplication.exit(result["exit_code"]))
 
 
 if __name__ == "__main__":

@@ -165,6 +165,8 @@ SET(TechDraw_SRCS
 )
 
 SET(Geometry_SRCS
+    DetailHatchGeometry.cpp
+    DetailHatchGeometry.h
     Geometry.cpp
     Geometry.h
     GeometryObject.cpp

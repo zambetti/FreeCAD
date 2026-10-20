@@ -467,6 +467,7 @@ void DrawViewSection::sectionExec(TopoDS_Shape& baseShape)
         return;
     }
 
+    m_sectionFacesReady = false;
     m_cuttingTool = makeCuttingTool(m_shapeSize);
 
     if (!DU::isGuiUp()) {
@@ -563,7 +564,6 @@ void DrawViewSection::makeSectionCut(const TopoDS_Shape& baseShape)
         return;
     }
 
-    waitingForCut(false);
 }
 
 //! position, scale and rotate shape for buildGeometryObject
@@ -628,12 +628,29 @@ TopoDS_Shape DrawViewSection::makeCuttingTool(double shapeSize)
 
 void DrawViewSection::onSectionCutFinished()
 {
+    // Completion (including an empty/failed cut) must release dependent details.
+    waitingForCut(false);
     if (DU::isGuiUp()) {
         QObject::disconnect(connectCutWatcher);
         showProgressMessage(getNameInDocument(), "has finished making section cut");
     }
 
-    m_preparedShape = prepareShape(getShapeToPrepare(), m_shapeSize);
+    const auto shapeToPrepare = getShapeToPrepare();
+    Bnd_Box cutBounds;
+    if (!shapeToPrepare.IsNull()) {
+        BRepBndLib::AddOptimal(shapeToPrepare, cutBounds);
+    }
+    if (cutBounds.IsVoid()) {
+        m_cutShape.Nullify();
+        m_preparedShape.Nullify();
+        m_sectionTopoDSFaces.Nullify();
+        m_tdSectionFaces.clear();
+        overrideKeepUpdated(false);
+        sectionFacesFinished();
+        requestPaint();
+        return;
+    }
+    m_preparedShape = prepareShape(shapeToPrepare, m_shapeSize);
     if (debugSection()) {
         BRepTools::Write(m_preparedShape, "DVSPreparedShape.brep");// debug
     }
@@ -710,9 +727,15 @@ void DrawViewSection::postHlrTasks()
     }
     overrideKeepUpdated(false);
 
+    // Never expose cut faces from the previous projection while rebuilding.
+    m_sectionTopoDSFaces.Nullify();
+    m_tdSectionFaces.clear();
     // build section face geometry
     TopoDS_Compound faceIntersections = findSectionPlaneIntersections(getShapeToIntersect());
     if (faceIntersections.IsNull()) {
+        if (!handleFaces() || CoarseView.getValue()) {
+            sectionFacesFinished();
+        }
         requestPaint();
         return;
     }
@@ -720,11 +743,16 @@ void DrawViewSection::postHlrTasks()
         BRepTools::Write(faceIntersections, "DVSFaceIntersections.brep");// debug
     }
 
+    m_sectionFaceScale = getScale();
+    m_sectionFaceRotation = Rotation.getValue();
     m_sectionTopoDSFaces = alignSectionFaces(faceIntersections);
     if (debugSection()) {
         BRepTools::Write(m_sectionTopoDSFaces, "DVSTopoSectionFaces.brep");// debug
     }
     m_tdSectionFaces = makeTDSectionFaces(m_sectionTopoDSFaces);
+    if (!handleFaces() || CoarseView.getValue()) {
+        sectionFacesFinished();
+    }
 
     auto* dvp = dynamic_cast<TechDraw::DrawViewPart*>(BaseView.getValue());
     if (dvp) {
@@ -732,6 +760,25 @@ void DrawViewSection::postHlrTasks()
     }
     requestPaint();// this will be a duplicate paint if we are making a
                    // standalone ComplexSection
+}
+
+void DrawViewSection::postFaceExtractionTasks()
+{
+    DrawViewPart::postFaceExtractionTasks();
+    sectionFacesFinished();
+}
+
+void DrawViewSection::sectionFacesFinished()
+{
+    if (handleFaces() && !CoarseView.getValue() && !faceExtractionSucceeded()) {
+        // A finished future is not necessarily a successful face extraction.
+        m_sectionTopoDSFaces.Nullify();
+        m_tdSectionFaces.clear();
+    }
+    m_sectionFacesReady = true;
+    for (auto* detail : getDetailRefs()) {
+        detail->onBaseSectionReady();
+    }
 }
 
 // activities that depend on a valid section cut
@@ -1196,13 +1243,20 @@ Base::Vector3d DrawViewSection::getCutCentroid() const
 
 std::vector<LineSet> DrawViewSection::getDrawableLines(int i)
 {
+    return getDrawableLines(getSectionTopoDSFace(i));
+}
+
+std::vector<LineSet> DrawViewSection::getDrawableLines(const TopoDS_Face& face)
+{
+    if (face.IsNull()) {
+        return {};
+    }
     if (m_lineSets.empty()) {
         makeLineSets();
     }
-    std::vector<LineSet> result;
     return DrawGeomHatch::getTrimmedLinesSection(this,
                                                  m_lineSets,
-                                                 getSectionTopoDSFace(i),
+                                                 face,
                                                  HatchScale.getValue(),
                                                  HatchRotation.getValue(),
                                                  HatchOffset.getValue());

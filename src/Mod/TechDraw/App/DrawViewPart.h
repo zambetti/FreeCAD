@@ -233,6 +233,7 @@ public:
     virtual void postHlrTasks(void);
     virtual void postFaceExtractionTasks(void);
     bool waitingForFaces() const { return m_waitingForFaces; }
+    bool faceExtractionSucceeded() const { return m_faceExtractionSucceeded; }
     void waitingForFaces(bool s) { m_waitingForFaces = s; }
     bool waitingForHlr() const { return m_waitingForHlr; }
     void waitingForHlr(bool s) { m_waitingForHlr = s; }
@@ -279,6 +280,7 @@ protected:
     Base::Vector3d shapeCentroid;
 
     bool m_handleFaces;
+    bool m_faceExtractionSucceeded = false;
 
     TopoDS_Shape m_saveShape;     //TODO: make this a Property.  Part::TopoShapeProperty??
     Base::Vector3d m_saveCentroid;//centroid before centering shape in origin

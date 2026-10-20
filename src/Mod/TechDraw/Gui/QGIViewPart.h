@@ -57,6 +57,7 @@ class QGIFace;
 class QGIEdge;
 class QGIHighlight;
 class PathBuilder;
+class ViewProviderViewSection;
 
 class TechDrawGuiExport QGIViewPart : public QGIView
 {
@@ -136,6 +137,11 @@ protected:
     QPainterPath drawPainterPath(TechDraw::BaseGeomPtr baseGeom) const;
     void drawViewPart();
     QGIFace* drawFace(TechDraw::FacePtr f, int idx);
+    void drawInheritedSectionFaces();
+    void drawSectionStyledFace(const TechDraw::FacePtr& outline,
+                               const TopoDS_Face& trimFace,
+                               TechDraw::DrawViewSection& source,
+                               ViewProviderViewSection& sourceVp);
 
     QVariant itemChange(GraphicsItemChange change, const QVariant &value) override;
     void hoverEnterEvent(QGraphicsSceneHoverEvent* event) override;

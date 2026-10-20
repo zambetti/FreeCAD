@@ -25,6 +25,8 @@
 #pragma once
 
 #include <gp_Ax2.hxx>
+#include <gp_Trsf.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 
 #include <App/DocumentObject.h>
@@ -84,6 +86,7 @@ public:
                          DrawViewPart* dvp,
                          DrawViewSection* dvs);
     void postHlrTasks(void) override;
+    void postFaceExtractionTasks() override;
     void waitingForDetail(bool s) { m_waitingForDetail = s; }
     bool waitingForDetail(void) const { return m_waitingForDetail; }
     bool waitingForResult() const override;
@@ -97,6 +100,11 @@ public:
     TopoDS_Shape getDetailShape() const { return m_detailShape; }
 
     Base::Vector3d mapPoint3dToDetail(const Base::Vector3d& inPoint) const;
+
+    // Residual OCC cut faces, in the same paper coordinates as section cut faces.
+    std::vector<TopoDS_Face> getInheritedSectionFaces(
+        const std::vector<int>& excludedDetailFaceIndices = {}) const;
+    void onBaseSectionReady();
 
 public Q_SLOTS:
     void onMakeDetailFinished(void);
@@ -122,6 +130,36 @@ protected:
     DrawViewSection* m_saveDvs;
 
     TopoDS_Shape m_detailShape;
+
+    // Capture the frame of an accepted geometry update, not later property edits
+    // on a frozen page. Only publish/cache coverage after face extraction finishes.
+    DrawViewSection* m_hatchSource = nullptr; // Identity only; BaseView owns the dependency.
+    TopoDS_Shape m_hatchSectionFaces;
+    gp_Trsf m_hatchTransform;
+    double m_hatchRadius = 0.0;
+    struct DetailParameters {
+        Base::Vector3d direction;
+        Base::Vector3d anchor;
+        gp_Ax2 viewAxis;
+        double radius = 0.0;
+        double scale = 1.0;
+        double rotation = 0.0;
+        bool square = false;
+    } m_detailParameters;
+    bool m_detailShapeReady = false;
+    bool m_inheritedFacesReady = false;
+    bool m_pendingRecompute = false;
+    bool m_detailUpdateActive = false;
+    void finishDetailUpdate();
+    void cancelInheritedUpdate();
+
+    mutable bool m_hatchCacheValid = false;
+    mutable bool m_cachedMatting = false;
+    mutable bool m_cachedSquareClip = false;
+    mutable std::vector<FacePtr> m_cachedDetailFaces;
+    mutable std::vector<bool> m_cachedHollowFaces;
+    mutable std::vector<int> m_cachedExcludedFaces;
+    mutable std::vector<TopoDS_Face> m_cachedInheritedFaces;
 };
 
 using DrawViewDetailPython = App::FeaturePythonT<DrawViewDetail>;

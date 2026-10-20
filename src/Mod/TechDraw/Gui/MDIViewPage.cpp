@@ -1059,13 +1059,17 @@ void MDIViewPage::sceneSelectionManager()
 // this is the same as Sketcher WB
 void MDIViewPage::selectOnRightPress(QGraphicsItem* item)
 {
-    while (item
-           && !dynamic_cast<QGIView*>(item)
-           && !dynamic_cast<QGIEdge*>(item)
-           && !dynamic_cast<QGIVertex*>(item)
-           && !dynamic_cast<QGIFace*>(item)
-           && !dynamic_cast<QGIDatumLabel*>(item)
-           && !dynamic_cast<QGMText*>(item)) {
+    while (item) {
+        auto* face = dynamic_cast<QGIFace*>(item);
+        // Skip decorative section faces as well as their hatch children, never selecting Face-1.
+        if (dynamic_cast<QGIView*>(item)
+            || dynamic_cast<QGIEdge*>(item)
+            || dynamic_cast<QGIVertex*>(item)
+            || (face && face->getProjIndex() >= 0)
+            || dynamic_cast<QGIDatumLabel*>(item)
+            || dynamic_cast<QGMText*>(item)) {
+            break;
+        }
         item = item->parentItem();
     }
     if (!item) {

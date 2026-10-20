@@ -60,6 +60,13 @@ QGIFace::QGIFace(int index) :
 {
     isHatched(false);
     setFlag(QGraphicsItem::ItemClipsChildrenToShape, true);
+    if (projIndex < 0) {
+        // Section overlays have no selectable projected-face identity.
+        setFlag(QGraphicsItem::ItemIsSelectable, false);
+        setFlag(QGraphicsItem::ItemIsFocusable, false);
+        setAcceptHoverEvents(false);
+        setAcceptedMouseButtons(Qt::NoButton);
+    }
 
     setStyle(Qt::NoPen);    //don't draw face lines, just fill for debugging
     //setStyle(Qt::DashLine);

@@ -4,8 +4,8 @@
 
 Do not run this file directly. The launcher supplies a fresh fixture/process per
 scenario. Listing cases imports only the standard library, not FreeCAD or Qt.
-These scenarios are staged for validation after the implementation build is ready;
-their existence/count is not a claim of passing GUI tests.
+Discovery counts do not establish passing GUI tests; result.json, methods.json,
+and subtests.json record the actual execution outcomes.
 
 Assertions use tolerant image measurements rather than platform-specific golden
 PNGs. Each negative assertion has a positive material/fill control. Style edits
@@ -14,17 +14,33 @@ measured by scanline crossings, a 90-degree rotation by diagonal correlation,
 offset by changed ink pixels, and PAT weight by increased coverage. This is not
 an exact phase-registration test between differently bounded faces.
 
-Qt scene access uses the page's QGraphicsView objectName (set by QGVPage) and the
-TechDraw Rez/Resolution preference (default 10 scene units/mm). The selection
-scenario is deliberately opt-in through --case selection (also in --case all).
-It sends QTest mouse events through the viewport, observes actual selection and
-preselection, and rejects Face-1. It does not insert a desired selection name.
+Qt scene access uses ViewProviderPage's <PageName>View objectName and the TechDraw
+Rez/Resolution preference (default 10 scene units/mm). The selection scenario is
+opt-in through --case selection (also in --case all). It sends QTest QWindow
+mouse events through native widget hit testing, observes actual scene hover focus
+and selection, and rejects Face-1. It never inserts a desired selection name.
 An unavailable visible page/Qt wrapper is an ERROR, never a silent skip/pass.
+
+GUI fixture constraints: disable active dock overlays and hide dock panels that
+otherwise intercept mouse events through transparent regions; retain custom
+QGraphicsItem wrappers until document
+closure (PySide can mark their C++-created parents Python-owned). Right-press
+selection disables detail ShowMatting to expose the actual decorative face,
+avoids the section's detail-reference marker, and filters only ContextMenu events
+to avoid modal menu hangs. It does not test context-menu actions. TechDraw hover
+sets QGraphicsScene focus rather than emitting Gui.Selection preselection.
+
+The transforms scenario uses a noncentral round hole, solid inherited fill and
+square cropping with ShowMatting=False. It checks an unrotated control, parent
+rotation, then additional detail rotation in live/SVG/PDF images. Expected hole
+centers and crop probes come from elementary 2D rotations, not inherited-face
+implementation helpers. The solid fill avoids the shared SVG-pattern exporter
+rotation/offset defect; style-svg deliberately keeps that defect failing.
 
 Scope limits: one flat section, one explicit face (TechDraw's zero-based Face0),
 one through ellipse, and one moving round hole. Deferred updates cover geometry;
 style deferral, nested details, perspective and cross-version image tolerances
-are not established here. Export/click execution awaits explicit run permission.
+are not established here.
 """
 
 import hashlib
@@ -91,6 +107,8 @@ class ScenarioContext:
         self.observations = {}
         self.pump = common["pump_events"]
         self.view = None
+        # Keep wrappers for FreeCAD-owned custom QGraphicsItems until document teardown.
+        self.qt_items = []
 
     def recompute(self):
         self.doc.recompute()
@@ -109,15 +127,44 @@ class ScenarioContext:
     def page_view(self):
         import FreeCAD as App
         import FreeCADGui as Gui
-        from PySide6 import QtCore, QtTest, QtWidgets
+        from PySide6 import QtCore, QtWidgets
 
         if self.view is None:
+            Gui.activateWorkbench("TechDrawWorkbench")
             self.page.ViewObject.show()
+            main = Gui.getMainWindow()
+            # OverlayManager can reshow hidden docks on its timer. ToggleAll disables
+            # overlays iff any overlay tab contains a dock (OverlayManager::setOverlayMode).
+            overlays = [w for w in main.findChildren(QtWidgets.QTabWidget)
+                        if w.inherits("Gui::OverlayTabWidget") and w.count()]
+            disabled_overlays = [w.objectName() for w in overlays]
+            if overlays:
+                Gui.runCommand("Std_DockOverlayAll")
+                self.pump(250)
+            # Transparent task/dock panels can still intercept native mouse events over
+            # the visible page. Hide them only in this disposable GUI fixture.
+            docks = main.findChildren(QtWidgets.QDockWidget)
+            hidden_docks = [w.objectName() for w in docks if w.isVisible()]
+            for dock in docks:
+                dock.hide()
             self.pump(150)
-            views = [v for v in Gui.getMainWindow().findChildren(QtWidgets.QGraphicsView)
-                     if v.objectName() == self.page.Name and v.isVisible()]
+            typed_views = main.findChildren(QtWidgets.QGraphicsView)
+            qt_views = [w for w in QtWidgets.QApplication.allWidgets() if w.inherits("QGraphicsView")]
+
+            def describe(widget):
+                return {"name": widget.objectName(), "class": widget.metaObject().className(),
+                        "python_type": str(type(widget)), "visible": widget.isVisible()}
+            self.common["write_json"](self.output / "page-widgets.json", {
+                "main_window": describe(main), "page_visibility": self.page.ViewObject.Visibility,
+                "disabled_overlays": disabled_overlays, "hidden_docks": hidden_docks,
+                "typed_views": [describe(w) for w in typed_views],
+                "qt_views": [describe(w) for w in qt_views],
+                "top_level_widgets": [describe(w) for w in QtWidgets.QApplication.topLevelWidgets()],
+            })
+            view_name = self.page.Name + "View"  # ViewProviderPage::createMDIViewPage
+            views = [v for v in typed_views if v.objectName() == view_name and v.isVisible()]
             if len(views) != 1:
-                raise RuntimeError(f"Need one visible QGVPage named {self.page.Name}, found {len(views)}")
+                raise RuntimeError(f"Need one visible QGVPage named {view_name}, found {len(views)}")
             self.view = views[0]
             self.rez = App.ParamGet("User parameter:BaseApp/Preferences/Mod/TechDraw/Rez").GetFloat(
                 "Resolution", 10.0)
@@ -126,9 +173,23 @@ class ScenarioContext:
             self.view.fitInView(self.scene_rect, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
             # Keep hover highlighting away from measured faces in live-scene captures.
             blank = self.view.mapFromScene(QtCore.QPointF(5 * self.rez, -115 * self.rez))
-            QtTest.QTest.mouseMove(self.view.viewport(), blank)
+            self.move_mouse(blank)
             self.pump(100)
         return self.view
+
+    def mouse_target(self, viewport_pos):
+        window = self.view.window().windowHandle()
+        if window is None:
+            raise RuntimeError("Page has no native window for QTest mouse events")
+        return window, window.mapFromGlobal(self.view.viewport().mapToGlobal(viewport_pos))
+
+    def move_mouse(self, viewport_pos):
+        from PySide6 import QtTest
+
+        # QWidget's QTest overload only warps QCursor for an unpressed move; on macOS
+        # that need not deliver a hover event. The QWindow overload sends a QPA event.
+        window, pos = self.mouse_target(viewport_pos)
+        QtTest.QTest.mouseMove(window, pos, 50)
 
     def live_image(self):
         from PySide6 import QtCore, QtGui
@@ -157,6 +218,7 @@ class ScenarioContext:
         return image.copy(left, top, width, height)
 
     def snapshot(self, name, *, live=False, exports=True):
+        import FreeCAD as App
         import FreeCADGui as Gui
         import TechDrawGui
 
@@ -180,7 +242,14 @@ class ScenarioContext:
                 "KeepUpdated": self.page.KeepUpdated,
                 "CutSurfaceDisplay": self.section.CutSurfaceDisplay,
                 "section_scale": self.section.Scale, "detail_scale": self.detail.Scale,
+                "section_rotation": self.section.Rotation.Value,
+                "detail_rotation": self.detail.Rotation.Value,
                 "detail_anchor": list(self.detail.AnchorPoint),
+                "detail_radius": self.detail.Radius,
+                "ShowMatting": self.detail.ShowMatting,
+                "MattingStyle": App.ParamGet(
+                    "User parameter:BaseApp/Preferences/Mod/TechDraw/Decorations"
+                ).GetInt("MattingStyle", 0),
                 "HatchScale": self.section.HatchScale,
                 "HatchRotation": str(self.section.HatchRotation),
                 "HatchOffset": list(self.section.HatchOffset),
@@ -220,7 +289,9 @@ class ScenarioContext:
                     pixels.append(image.pixelColor(px, py).getRgb()[:3])
         if not pixels:
             raise ValueError("Empty ring probe")
-        result = {"pixels": len(pixels), "red_fraction": sum(colored(p, "red") for p in pixels) / len(pixels)}
+        result = {"pixels": len(pixels),
+                  "red_fraction": sum(colored(p, "red") for p in pixels) / len(pixels),
+                  "dark_fraction": sum(max(p) < 120 for p in pixels) / len(pixels)}
         key = f"{fmt}/{role}/ring-{center}-{inner:g}-{outer:g}"
         self.observations[name]["samples"][key] = result
         self.save_observations()
@@ -529,6 +600,99 @@ class GeometryUpdateTests(ScenarioTest):
         c.doc.saveAs(str(c.output / "updates-reproducer.FCStd"))
 
 
+class TransformTests(ScenarioTest):
+    def test_parent_and_detail_rotation_with_unmatted_square_crop(self):
+        import FreeCAD as App
+
+        c = self.context
+        decorations = App.ParamGet("User parameter:BaseApp/Preferences/Mod/TechDraw/Decorations")
+        decorations.SetInt("MattingStyle", 1)
+        c.detail.ShowMatting = False
+        c.detail.ShowHighlight = False
+        c.section.CutSurfaceDisplay = "Color"
+        c.section.ViewObject.CutSurfaceColor = RED
+        c.section.ViewObject.LineWidth = 0.15
+        c.detail.ViewObject.LineWidth = 0.15
+        c.set_shape(stock_with_round_hole(4))
+
+        def rotate(point, degrees):
+            angle = math.radians(degrees)
+            x, y = point
+            return (x * math.cos(angle) - y * math.sin(angle),
+                    x * math.sin(angle) + y * math.cos(angle))
+
+        def bounds(center, half):
+            x, y = center
+            return (x - half, y - half, x + half, y + half)
+
+        previous_centers = {}
+        stages = (("unrotated", 0, 0), ("parent-90", 90, 0), ("parent-90-detail-45", 90, 45))
+        for step, parent_angle, detail_angle in stages:
+            c.section.Rotation = parent_angle
+            if c.detail.Rotation.Value != detail_angle:
+                # ReadOnly is editor-only (PropertyContainerPy::setCustomAttributes).
+                # This editor-read-only Prop_Output gets an explicit geometry request;
+                # this step tests its transform, not automatic property invalidation.
+                c.detail.Rotation = detail_angle
+                c.detail.touch()
+            c.recompute()
+            c.snapshot(step, live=True)
+            parent_center = rotate((4, 0), parent_angle)
+            centers = {"section": parent_center,
+                       "detail": tuple(2 * v for v in rotate(parent_center, detail_angle))}
+            c.observations[step]["expected"] = {
+                "hole_centers_view_mm": centers,
+                "square_crop_rotation_degrees": detail_angle,
+            }
+            c.save_observations()
+            with self.subTest(step=step, check="transform-fixture"):
+                self.assertAlmostEqual(c.section.Rotation.Value, parent_angle)
+                self.assertAlmostEqual(c.detail.Rotation.Value, detail_angle)
+                self.assertEqual((c.section.Scale, c.detail.Scale), (1, 2))
+                self.assertEqual(list(c.detail.AnchorPoint), [0, 0, 0])
+                self.assertEqual(c.detail.Radius, 10)
+                self.assertFalse(c.detail.ShowMatting)
+                self.assertEqual(decorations.GetInt("MattingStyle"), 1)
+            for fmt in c.images[step]:
+                for role, scale in (("section", 1), ("detail", 2)):
+                    center = centers[role]
+                    radius = 2.2 * scale
+                    with self.subTest(step=step, format=fmt, role=role, check="rotated-hole-void"):
+                        metrics = c.probe(step, fmt, role, bounds(center, 0.7 * scale), "hole")
+                        self.assertEqual(metrics["red"]["pixels"], 0, metrics)
+                    with self.subTest(step=step, format=fmt, role=role, check="hole-material"):
+                        ring = c.ring(step, fmt, role, center, radius + 0.5, radius + 1)
+                        self.assertGreater(ring["red_fraction"], 0.8, ring)
+                    with self.subTest(step=step, format=fmt, role=role, check="hole-contour"):
+                        ring = c.ring(step, fmt, role, center, radius - 0.35, radius + 0.35)
+                        self.assertGreater(ring["dark_fraction"], 0.05, ring)
+                    if role in previous_centers and previous_centers[role] != center:
+                        with self.subTest(step=step, format=fmt, role=role, check="old-hole-refilled"):
+                            metrics = c.probe(step, fmt, role,
+                                             bounds(previous_centers[role], 0.35 * scale),
+                                             "old-hole")
+                            self.assertGreater(metrics["red"]["fraction"], 0.8, metrics)
+                # The crop is square in the parent's output coordinates; only the
+                # additional detail rotation rotates it. These corners lie outside
+                # a circular crop and, at 45 degrees, outside an unrotated square.
+                corners = [rotate((x, y), detail_angle)
+                           for x, y in ((17, 17), (-17, 17), (-17, -17), (17, -17))]
+                outside = [rotate(point, detail_angle)
+                           for point in ((23, 0), (0, 23), (-23, 0), (0, -23))]
+                for label, points, filled in (("square-corners", corners, True),
+                                              ("outside-square", outside, False)):
+                    metrics = [c.probe(step, fmt, "detail", bounds(point, 1.2), f"{label}-{i}")
+                               for i, point in enumerate(points)]
+                    with self.subTest(step=step, format=fmt, check=label):
+                        for sample in metrics:
+                            if filled:
+                                self.assertGreater(sample["red"]["fraction"], 0.8, sample)
+                            else:
+                                self.assertEqual(sample["red"]["pixels"], 0, sample)
+            previous_centers = centers
+        c.doc.saveAs(str(c.output / "transforms-reproducer.FCStd"))
+
+
 class DeferredUpdateTests(ScenarioTest):
     def test_keep_updated_defers_geometry_until_resumed(self):
         c = self.context
@@ -563,7 +727,7 @@ class DeferredUpdateTests(ScenarioTest):
 class SelectionTests(ScenarioTest):
     def test_real_face_click_never_selects_synthetic_face_minus_one(self):
         import FreeCADGui as Gui
-        from PySide6 import QtCore, QtTest
+        from PySide6 import QtCore, QtTest, QtWidgets
 
         c = self.context
         c.section.CutSurfaceDisplay = "Color"
@@ -578,33 +742,161 @@ class SelectionTests(ScenarioTest):
             def setPreselection(self, doc, obj, sub):
                 events.append({"document": doc, "object": obj, "subelement": sub})
 
+        moves = []
+
+        class MouseObserver(QtCore.QObject):
+            def eventFilter(self, watched, event):
+                if event.type() == QtCore.QEvent.Type.MouseMove:
+                    moves.append([event.position().x(), event.position().y()])
+                return False
+
         observer = Observer()
+        mouse_observer = MouseObserver()
+        view.viewport().installEventFilter(mouse_observer)
         Gui.Selection.addObserver(observer)
         try:
+            main = Gui.getMainWindow()
+            main.raise_()
+            main.activateWindow()
+            c.pump(250)
             Gui.Selection.clearSelection()
             x, y = c.common["POSITIONS"]["detail"]
             pos = view.mapFromScene(QtCore.QPointF((x + 2) * c.rez, -(y + 3) * c.rez))
             if not view.viewport().rect().contains(pos):
                 raise RuntimeError("Selection point is outside the actual viewport")
             view.setFocus()
-            QtTest.QTest.mouseMove(view.viewport(), pos, 50)
+            blank = view.mapFromScene(QtCore.QPointF(5 * c.rez, -115 * c.rez))
+            c.move_mouse(blank)
+            c.move_mouse(pos)
             c.pump(150)
-            QtTest.QTest.mouseClick(view.viewport(), QtCore.Qt.MouseButton.LeftButton,
-                                   QtCore.Qt.KeyboardModifier.NoModifier, pos, 50)
+            widget_at = QtWidgets.QApplication.widgetAt(view.viewport().mapToGlobal(pos))
+            hover_state = {
+                "viewport_moves": moves, "view_has_focus": view.hasFocus(),
+                "scene_has_focus": view.scene().hasFocus(), "window_active": main.isActiveWindow(),
+                "viewport_mouse_tracking": view.viewport().hasMouseTracking(),
+                "widget_at_point": None if widget_at is None else widget_at.metaObject().className(),
+                "widget_at_is_viewport": widget_at == view.viewport(),
+                "viewport_point": [pos.x(), pos.y()],
+            }
+            main.grab().save(str(c.output / "selection-window.png"))
+            c.common["write_json"](c.output / "hover-state.json", hover_state)
+            if not hover_state["widget_at_is_viewport"]:
+                raise RuntimeError(f"Page mouse target is obstructed: {hover_state}")
+            # QGIPrimPath::hoverEnterEvent sets scene focus, not Gui.Selection preselection.
+            hovered = view.scene().focusItem()
+            c.qt_items.append(hovered)
+            hover_record = None if hovered is None else {
+                "type": hovered.type(), "z": hovered.zValue(),
+                "selectable": bool(hovered.flags() & QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable),
+                "accepts_hover": hovered.acceptHoverEvents(),
+            }
+            window, window_pos = c.mouse_target(pos)
+            QtTest.QTest.mouseClick(window, QtCore.Qt.MouseButton.LeftButton,
+                                   QtCore.Qt.KeyboardModifier.NoModifier, window_pos, 50)
             c.pump(200)
             selected = [{"object": item.ObjectName, "subelements": list(item.SubElementNames)}
                         for item in Gui.Selection.getSelectionEx()]
+            selected_items = view.scene().selectedItems()
+            c.qt_items.extend(selected_items)
+            hovered_was_selected = hovered is not None and hovered in selected_items
         finally:
             Gui.Selection.removeObserver(observer)
-        c.common["write_json"](c.output / "selection.json", {"preselection": events, "selected": selected})
+            view.viewport().removeEventFilter(mouse_observer)
+        c.common["write_json"](c.output / "selection.json", {
+            "preselection": events, "selected": selected, "hover_focus": hover_record,
+            "hover_state": hover_state,
+            "hovered_was_selected": hovered_was_selected,
+        })
         with self.subTest(check="real-face-selected"):
             self.assertTrue(any(item["object"] == c.detail.Name and "Face0" in item["subelements"]
                                 for item in selected), selected)
         with self.subTest(check="no-synthetic-selection"):
             self.assertFalse(any(sub.startswith("Face-") for item in selected for sub in item["subelements"]), selected)
         with self.subTest(check="real-face-hover"):
-            self.assertTrue(any(e["object"] == c.detail.Name and e["subelement"] == "Face0" for e in events), events)
+            self.assertIsNotNone(hover_record)
+            self.assertTrue(hover_record["selectable"] and hover_record["accepts_hover"], hover_record)
+            self.assertTrue(hovered_was_selected, "Hover must focus the real face selected by the subsequent click")
             self.assertFalse(any(e["subelement"].startswith("Face-") for e in events), events)
+
+    def test_right_press_skips_decorative_section_faces(self):
+        import FreeCADGui as Gui
+        import shiboken6
+        from PySide6 import QtCore, QtTest, QtWidgets
+
+        c = self.context
+        c.section.CutSurfaceDisplay = "Color"
+        c.section.ViewObject.CutSurfaceColor = RED
+        # QGIMatting's unfilled circular border still hits its interior at a higher Z.
+        # Disable it via the public property so this test actually hits the inherited face.
+        c.detail.ShowMatting = False
+        c.recompute()
+        c.snapshot("before-right-selection")
+        self.check_tint("before-right-selection", "red", 0.8)
+        view = c.page_view()
+        records = {}
+
+        class SuppressMenu(QtCore.QObject):
+            def eventFilter(self, watched, event):
+                # Exercise QGVPage::mousePressEvent, not the subsequent modal QMenu::exec.
+                if event.type() == QtCore.QEvent.Type.ContextMenu:
+                    return True
+                return False
+
+        app = QtWidgets.QApplication.instance()
+        menu_filter = SuppressMenu()
+        app.installEventFilter(menu_filter)
+        try:
+            for role, target in (("section", c.section), ("detail", c.detail)):
+                Gui.Selection.clearSelection()
+                c.move_mouse(view.mapFromScene(QtCore.QPointF(5 * c.rez, -115 * c.rez)))
+                c.pump(100)
+                x, y = c.common["POSITIONS"][role]
+                # Avoid the source view's detail-reference highlight above its section face.
+                dx = 14 if role == "section" else 2
+                pos = view.mapFromScene(QtCore.QPointF((x + dx) * c.rez, -(y + 3) * c.rez))
+                if not view.viewport().rect().contains(pos):
+                    raise RuntimeError("Right-click point is outside the actual viewport")
+                if QtWidgets.QApplication.widgetAt(view.viewport().mapToGlobal(pos)) != view.viewport():
+                    raise RuntimeError(f"Right-click target for {role} is obstructed by another widget")
+                hit = view.itemAt(pos)
+                chain = []
+                item = hit
+                while item is not None:
+                    c.qt_items.append(item)
+                    chain.append({"type": item.type(), "z": item.zValue(),
+                                  "flags": str(item.flags()), "buttons": str(item.acceptedMouseButtons()),
+                                  "python_owns_wrapper": shiboken6.ownedByPython(item)})
+                    item = item.parentItem()
+                records[role] = {"hit_chain": chain, "phase": "before-press"}
+                c.common["write_json"](c.output / "right-selection.json", records)
+                with self.subTest(role=role, check="decorative-hit"):
+                    self.assertIsNotNone(hit)
+                    self.assertFalse(hit.flags() & QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+                    self.assertEqual(hit.acceptedMouseButtons(), QtCore.Qt.MouseButton.NoButton)
+                window, window_pos = c.mouse_target(pos)
+                try:
+                    # MDIViewPage::selectOnRightPress runs on press, before any context menu.
+                    QtTest.QTest.mousePress(window, QtCore.Qt.MouseButton.RightButton,
+                                           QtCore.Qt.KeyboardModifier.NoModifier, window_pos, 50)
+                    c.pump(100)
+                    selected = [{"object": item.ObjectName, "subelements": list(item.SubElementNames)}
+                                for item in Gui.Selection.getSelectionEx()]
+                    records[role].update(phase="after-press", selected_on_press=selected)
+                    c.common["write_json"](c.output / "right-selection.json", records)
+                finally:
+                    QtTest.QTest.mouseRelease(window, QtCore.Qt.MouseButton.RightButton,
+                                             QtCore.Qt.KeyboardModifier.NoModifier, window_pos, 50)
+                    c.pump(150)
+                records[role]["phase"] = "after-release"
+                c.common["write_json"](c.output / "right-selection.json", records)
+                with self.subTest(role=role, check="right-selects-owner"):
+                    self.assertTrue(any(item["object"] == target.Name
+                                        and not any(item["subelements"]) for item in selected), selected)
+                with self.subTest(role=role, check="right-no-synthetic-face"):
+                    self.assertFalse(any(sub.startswith("Face-") for item in selected
+                                         for sub in item["subelements"]), selected)
+        finally:
+            app.removeEventFilter(menu_filter)
 
 
 SCENARIOS = {
@@ -615,8 +907,9 @@ SCENARIOS = {
     "explicit-pat": (ExplicitPatTests, "PAT > explicit SVG > inherited SVG; removal fallbacks"),
     "holes-clipping": (HolesClippingTests, "Thin ellipse void and circular clipping in SVG/PDF pixels"),
     "updates": (GeometryUpdateTests, "Parent solid, detail anchor/scale and parent scale updates"),
+    "transforms": (TransformTests, "Parent/detail rotation, noncentral hole, square crop without matting"),
     "deferred": (DeferredUpdateTests, "KeepUpdated=False freezes live geometry; resume updates"),
-    "selection": (SelectionTests, "Real Qt hover/click selects Face0, never inherited Face-1"),
+    "selection": (SelectionTests, "Real Qt left/right events never select decorative Face-1"),
 }
 
 
@@ -624,6 +917,9 @@ def make_suite(name, common, fixture, output, pdftoppm):
     test_class, _ = SCENARIOS[name]
     context = ScenarioContext(common, fixture, output, pdftoppm)
     suite = unittest.TestSuite()
+    # TestSuite discards completed tests; keep Qt wrappers alive until the caller
+    # closes the document, not just until the last selection method returns.
+    suite.fixture_context = context
     for method in unittest.defaultTestLoader.getTestCaseNames(test_class):
         test = test_class(method)
         test.context = context

@@ -27,11 +27,20 @@ Section cut faces are stored separately from ordinary projected faces. `QGIViewS
 
 Current main also contains the v26.3 face finder and void identification. The experiment must handle its deferred section-face construction, rather than assuming the historical implementation still applies unchanged.
 
-The implementation in progress keeps authoritative OCC cut topology through geometric association and PAT trimming. Detail coverage is determined geometrically, not by matching parent/detail face numbers. Explicit detail hatches subtract their coverage from inherited regions. A per-detail completed-geometry cache is independent of hatch style. The section and detail share the existing cut-surface renderer; ordinary face selection remains separate from decorative hatch faces.
+The implementation keeps authoritative OCC cut topology through geometric association and PAT trimming. Detail coverage is determined geometrically, not by matching parent/detail face numbers. Explicit detail hatches subtract their coverage from inherited regions. A per-detail completed-geometry cache is independent of hatch style. The section and detail share the existing cut-surface renderer; ordinary face selection remains separate from decorative hatch faces.
 
 ## Build and regression commands
 
-Reuse the configured Pixi environment and build tree. Targeted build/test commands and final results will be recorded after implementation.
+Reuse the configured Pixi environment and build tree:
+
+```sh
+pixi run --frozen cmake --build build/relWithDebInfo \
+  --target TechDraw TechDrawGui TechDraw_tests_run -j 6
+pixi run --frozen ctest --test-dir build/relWithDebInfo \
+  -R 'DetailHatch|DrawViewDetailHatching|TestLineFormat' --output-on-failure
+```
+
+The targeted build succeeds. The latest focused CTest run (`detail-hatch-ctest-03.log`) passed all 39 tests in 9.32 seconds. Adding source/test files caused normal CMake regeneration within the existing build; no clean build or compiler reconfiguration was performed.
 
 The GUI regression launcher runs scenarios in separate bounded FreeCAD processes with isolated preferences. It uses Qt to render SVG and installed Poppler `pdftoppm` to inspect PDF output. It requires a usable GUI session on macOS. It rejects reused output directories to avoid stale-artifact false positives.
 
@@ -46,8 +55,10 @@ pixi run --frozen --environment default python \
   --case baseline --timeout 120
 ```
 
-Use `--case all` for all scenarios, or repeat `--case` to select scenarios. Each scenario produces runtime metadata, test results, exports, and rendered images. Additional scenarios are currently written but not yet runtime-validated; discovered test counts are not passing-test results.
+Use `--case all` for all scenarios, or repeat `--case` to select scenarios. Each scenario produces runtime metadata, test results, exports, and rendered images. The first fixed-build GUI run (`detail-hatch-fixed-03`) passed 15 of 16 methods and 316 of 324 subtests, with no errors, skips, or timeouts. The eight failures are SVG-pattern rotation/offset exports in both section and detail; see below. Later robustness changes and a new transform scenario await final GUI validation.
 
 ## Work checkpoint
 
-The baseline reproduction is complete. App geometry/cache/lifecycle integration and GUI sharing are in progress. No fixed-build results or new human visual acceptance have yet been claimed. Final documentation will include exact build/test results, manual verification steps, supported scope, and known limitations.
+Implementation and focused C++ regression coverage are complete; final GUI and broader existing-suite validation are pending. New files are included in local Git checkpoints. No new human visual acceptance is claimed.
+
+A source-confirmed pre-existing limitation is retained rather than fixed outside scope: SVG hatch rotation and offset work in the live scene but are lost in SVG/PDF exports for both ordinary sections and details. `QGIFace::buildPixHatch()` has a commented-out transform and loads the untransformed pixmap. The relevant exporter functions are byte-identical to the starting commit. The historical baseline only used zero rotation/offset, so this is not claimed as a historical runtime reproduction of that separate defect. The stricter regression assertions remain failing, not skipped or marked expected failures.

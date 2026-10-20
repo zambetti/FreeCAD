@@ -66,6 +66,9 @@ public:
     bool canDelete(App::DocumentObject* obj) const override;
 
     TechDraw::DrawViewSection* getViewObject() const override;
+
+private:
+    void repaintDependentDetails();
 };
 
 } // namespace TechDrawGui

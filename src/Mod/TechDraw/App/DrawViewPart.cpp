@@ -471,8 +471,8 @@ void DrawViewPart::postHlrTasks()
         }
     }
 
-    // rescale if view doesn't fit on page
-    if (ScaleType.isValue("Automatic") && !checkFit()) {
+    // Details rescale after their crop and face extraction have both finished.
+    if (!isDerivedFrom<DrawViewDetail>() && ScaleType.isValue("Automatic") && !checkFit()) {
         double newScale = autoScale();
         Scale.setValue(newScale);
         partExec(m_saveShape);
@@ -503,6 +503,7 @@ void DrawViewPart::postFaceExtractionTasks()
 //! make faces from the edge geometry
 void DrawViewPart::extractFaces()
 {
+    m_faceExtractionSucceeded = false;
     if (!geometryObject) {
         //geometry is in flux, can not make faces right now
         return;
@@ -533,6 +534,9 @@ void DrawViewPart::extractFaces()
                                     static_cast<int>(Preferences::faceFinderVersion()));
             return;
     }
+    // An exception or a face-finder failure must not publish cacheable coverage.
+    // An empty drawing needs no inherited hatching, so leave it unready as well.
+    m_faceExtractionSucceeded = !geometryObject->getFaceGeometry().empty();
 }
 
 void DrawViewPart::findFacesV26_3(const std::vector<BaseGeomPtr> &goEdges)

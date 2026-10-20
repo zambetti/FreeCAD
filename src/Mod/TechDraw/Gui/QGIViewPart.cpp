@@ -26,6 +26,7 @@
 #include <QKeyEvent>
 #include <QGraphicsTransform>
 #include <cstdio>
+#include <memory>
 #include <qmath.h>
 
 #include <App/Application.h>
@@ -309,6 +310,7 @@ void QGIViewPart::drawViewPart()
     if (viewPart->handleFaces() && !viewPart->CoarseView.getValue()) {
         drawAllFaces();
     }
+    drawInheritedSectionFaces();
 
     drawAllEdges();
 
@@ -403,6 +405,105 @@ void QGIViewPart::drawAllFaces(void)
         newFace->draw();
         iFace++;
     }
+}
+
+void QGIViewPart::drawInheritedSectionFaces()
+{
+    auto* detail = dynamic_cast<TechDraw::DrawViewDetail*>(getViewObject());
+    if (!detail) {
+        return;
+    }
+
+    auto* section = dynamic_cast<TechDraw::DrawViewSection*>(detail->BaseView.getValue());
+    if (!section || section->CutSurfaceDisplay.isValue("Hide")) {
+        return;
+    }
+
+    auto* sectionVp = freecad_cast<ViewProviderViewSection*>(getViewProvider(section));
+    if (!sectionVp) {
+        return;
+    }
+
+    const auto regularHatches = detail->getHatches();
+    const auto geomHatches = detail->getGeomHatches();
+    const auto faceCount = static_cast<int>(detail->getFaceGeometry().size());
+    std::vector<int> excludedFaces;
+    for (int i = 0; i < faceCount; ++i) {
+        if (faceIsHatched(i, regularHatches) || faceIsGeomHatched(i, geomHatches)) {
+            excludedFaces.push_back(i);
+        }
+    }
+
+    const auto sectionFaces = detail->getInheritedSectionFaces(excludedFaces);
+    for (const auto& face : sectionFaces) {
+        if (face.IsNull()) {
+            continue;
+        }
+        // Keep the authoritative residual face for PAT trimming; TD geometry is only the outline.
+        auto outline = std::make_shared<TechDraw::Face>(face);
+        drawSectionStyledFace(outline, face, *section, *sectionVp);
+    }
+}
+
+void QGIViewPart::drawSectionStyledFace(const TechDraw::FacePtr& outline,
+                                      const TopoDS_Face& trimFace,
+                                      TechDraw::DrawViewSection& source,
+                                      ViewProviderViewSection& sourceVp)
+{
+    if (source.CutSurfaceDisplay.isValue("Hide")) {
+        return;
+    }
+
+    QGIFace* newFace = drawFace(outline, -1);
+    newFace->setZValue(ZVALUE::SECTIONFACE);
+    if (source.showSectionEdges()) {
+        float lineWidth = sourceVp.LineWidth.getValue();
+        newFace->setDrawEdges(true);
+        newFace->setStyle(Qt::SolidLine);
+        newFace->setWidth(lineWidth);
+    } else {
+        newFace->setDrawEdges(false);
+    }
+
+    QColor faceColor = sourceVp.CutSurfaceColor.getValue().asValue<QColor>();
+    faceColor.setAlpha((100 - sourceVp.CutSurfaceTransparency.getValue())*255/100);
+
+    if (source.CutSurfaceDisplay.isValue("Color")) {
+        newFace->isHatched(true);
+        newFace->setFillColor(faceColor);
+        newFace->setFillMode(faceColor.alpha() ? FillMode::PlainFill : FillMode::NoFill);
+    } else if (source.CutSurfaceDisplay.isValue("SvgHatch")) {
+        newFace->isHatched(true);
+        newFace->setFillColor(faceColor);
+        newFace->setFillMode(FillMode::SvgFill);
+        newFace->setHatchColor(sourceVp.HatchColor.getValue());
+        newFace->setHatchScale(source.HatchScale.getValue());
+        newFace->setHatchRotation(source.HatchRotation.getValue());
+        newFace->setHatchOffset(source.HatchOffset.getValue());
+        std::string hatchSpec = source.SvgIncluded.getValue();
+        newFace->setHatchFile(hatchSpec);
+    } else if (source.CutSurfaceDisplay.isValue("PatHatch")) {
+        newFace->isHatched(true);
+        newFace->setFillColor(faceColor);
+        newFace->setFillMode(FillMode::GeomHatchFill);
+        newFace->setHatchColor(sourceVp.GeomHatchColor.getValue());
+        newFace->setHatchScale(source.HatchScale.getValue());
+        newFace->setHatchRotation(source.HatchRotation.getValue());
+        newFace->setHatchOffset(source.HatchOffset.getValue());
+        newFace->setLineWeight(sourceVp.WeightPattern.getValue());
+        std::vector<TechDraw::LineSet> lineSets = source.getDrawableLines(trimFace);
+        if (!lineSets.empty()) {
+            for (auto& ls: lineSets) {
+                newFace->addLineSet(ls);
+            }
+        }
+    } else {
+        Base::Console().warning("QGIVS::draw - unknown CutSurfaceDisplay: {}\n",
+                                source.CutSurfaceDisplay.getValue());
+    }
+
+    newFace->draw();
+    newFace->setPrettyNormal();
 }
 
 void QGIViewPart::drawAllEdges()

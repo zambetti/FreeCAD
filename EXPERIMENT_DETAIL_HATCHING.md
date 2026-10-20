@@ -2,7 +2,7 @@
 
 This is an openly AI-assisted experiment for [FreeCAD issue #17090](https://github.com/FreeCAD/FreeCAD/issues/17090), **not an upstream pull request or an officially supported FreeCAD feature**. It demonstrates a useful change for developers to inspect, improve, or disregard without an obligation to maintain it.
 
-The implementation, tests, and this record were developed primarily using an AI coding agent, GPT-6-Astra, with human direction. Automated output checks and agent inspection of rendered exports have been performed. **Human visual verification of this new implementation is still pending.** Human verification of an earlier, deleted experiment is not evidence for this branch. Commits disclose AI assistance using the repository's `Assisted-by` convention; publication is intended as an experiment, not a claim of upstream contribution-policy acceptance.
+The implementation, tests, and this record were developed primarily using an AI coding agent, GPT-6-Astra, with human direction. Automated output checks and agent inspection of rendered exports have been performed. **Human visual verification of this new implementation was successfully completed on 20 October 2026.** See [Manual verification](#manual-verification) for the verified functionality and scope. Human verification of an earlier, deleted experiment is not evidence for this branch. Commits disclose AI assistance using the repository's `Assisted-by` convention; publication is intended as an experiment, not a claim of upstream contribution-policy acceptance.
 
 ## Starting point and baseline
 
@@ -156,6 +156,8 @@ All paths below are under ignored `build/relWithDebInfo/`, not committed build a
 
 ## Manual verification
 
+On **20 October 2026**, the contributor manually launched and tested the locally built FreeCAD application and confirmed that a Detail View created from a hatched Section View now displays the previously missing inherited section hatching correctly in the tested drawing. This confirms the primary user-visible functionality and resolves the original visible problem described in issue #17090 for that drawing. It does **not** establish that every rendering mode, export scenario, or edge case has been manually verified; the broader checks below remain instructions, not a record that all were performed.
+
 ### Open the generated reproducible example
 
 After running the quick GUI scenario, open its `reproducer.FCStd` with the built FreeCAD. The final local validation fixture can be opened directly:
@@ -187,7 +189,7 @@ Create a solid box (or a bored solid), insert a TechDraw page and ordinary view,
 - **GUI isolation:** the final 11 scenarios pass or fail assertions normally in separate GUI processes; they do not establish reliability of sequential export scenarios in one GUI process. One disposable diagnostic process stalled at its 240-second limit (`detail-hatch-rebuild04-investigate-03/timeout.json`); it is not counted as a passing run. The final suites themselves had no timeouts. Both existing Python suites and all C++ tests also passed their respective shared-process runs.
 - **Measured geometry-cache cost:** the final synthetic test has 100 section faces and 100 overlapping coverage faces, verifies 400 mm² without duplicate fill, and checks OCC identity across 100 cached reads with ten style changes. The first getter took **109.587 ms**; all 100 cached getters together took **0.612291 ms** on this machine. Timings exclude fixture construction/assertions and are informational, not enforced thresholds. They do not benchmark the same geometry as the deleted experiment's 2.2-second example.
 - **Cache boundary:** PAT line generation and SVG rendering are still performed during drawing. The cache only avoids repeated geometry association/clipping booleans. There is no global cache or new persistence format.
-- **Human acceptance:** the new branch still needs the user's visual review before making claims of human verification.
+- **Human verification scope:** the successful contributor check described under [Manual verification](#manual-verification) confirms the primary user-visible functionality in the tested drawing, not exhaustive manual coverage of rendering modes, exports, or edge cases. The automated results and other documented limitations remain unchanged.
 
 ## Changed-file guide and publication status
 

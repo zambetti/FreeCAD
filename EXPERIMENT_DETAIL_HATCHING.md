@@ -1,6 +1,8 @@
+![TechDraw showing inherited section hatching in a Detail View](EXPERIMENT_DETAIL_HATCHING.png)
+
 # Experimental inherited TechDraw detail hatching
 
-This is an openly AI-assisted experiment for [FreeCAD issue #17090](https://github.com/FreeCAD/FreeCAD/issues/17090), **not an upstream pull request or an officially supported FreeCAD feature**. It demonstrates a useful change for developers to inspect, improve, or disregard without an obligation to maintain it.
+This is an openly 100%-AI experiment for [FreeCAD issue #17090](https://github.com/FreeCAD/FreeCAD/issues/17090), **not an upstream pull request or an officially supported FreeCAD feature**. It demonstrates a maybe-useful implementation for developers to consider, improve, or disregard.
 
 The implementation, tests, and this record were developed primarily using an AI coding agent, GPT-6-Astra, with human direction. Automated output checks and agent inspection of rendered exports have been performed. **Human visual verification of this new implementation was successfully completed on 20 October 2026.** See [Manual verification](#manual-verification) for the verified functionality and scope. Human verification of an earlier, deleted experiment is not evidence for this branch. Commits disclose AI assistance using the repository's `Assisted-by` convention; publication is intended as an experiment, not a claim of upstream contribution-policy acceptance.
 
@@ -209,5 +211,3 @@ The following 22 files comprise the experiment:
 | Build/test registration | `src/Mod/TechDraw/App/CMakeLists.txt`, `tests/src/Mod/TechDraw/App/CMakeLists.txt` |
 
 The implementation, tests, and documentation are preserved in local checkpoints, including the baseline reproduction (`d3fe338a7a`) and main implementation (`59df330aae`), followed by final corrections/results. Use `git log` for the final checkpoint hash and `git diff 33adf618dcebfb167795a219175e7dbb18f7a353 --stat` for the complete change set. No build outputs, private GUI preferences, machine-specific configuration, or unrelated submodule changes are intended for publication.
-
-The branch is ready for review and publication **as an experimental branch with these explicit limitations**, not as a fully green upstream submission. No push, force-push, or pull request has been performed. Publishing remains the user's decision.
